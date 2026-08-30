@@ -1,4 +1,9 @@
--- Cadence schema.
+-- Cadence schema — consolidated.
+--
+-- This combines the original schema, the 002_feedback migration (IMAP/bounce
+-- tracking, replied state, campaign_health view), and the employee_count
+-- column added during lead-sourcing work. Safe to run once, top to bottom,
+-- against a fresh empty database.
 --
 -- The scheduler lives in Postgres, not in a broker. A single send decision needs
 -- the suppression list, the mailbox warmup budget, the per-recipient-domain
@@ -22,6 +27,20 @@ CREATE TABLE mailbox (
   smtp_user     text,
   smtp_pass     text,
   resend_key    text,
+
+  -- IMAP credentials. Separate columns from SMTP because they genuinely differ
+  -- on some providers, and because a mailbox can be send-only (Resend) while
+  -- still having a real inbox somewhere that collects its bounces.
+  imap_host        text,
+  imap_port        int DEFAULT 993,
+  imap_user        text,
+  imap_pass        text,
+  -- IMAP UIDs are only meaningful within a UIDVALIDITY epoch. Store both, or a
+  -- mailbox rebuild on the provider's side silently makes you reprocess or skip
+  -- everything depending on which way the numbers moved.
+  imap_uidvalidity bigint,
+  imap_last_uid    bigint NOT NULL DEFAULT 0,
+  last_polled_at   timestamptz,
 
   -- Warmup. A mailbox earns throughput, it is not granted it.
   activated_on  date NOT NULL DEFAULT CURRENT_DATE,
@@ -98,7 +117,8 @@ CREATE TABLE lead (
   business    text NOT NULL,
   website     text,
   city        text,
-  fields      jsonb NOT NULL DEFAULT '{}',  -- every other CSV column, verbatim
+  employee_count int,                 -- from CSV, used to flag oversized companies at ingest
+  fields      jsonb NOT NULL DEFAULT '{}',  -- every other CSV column, verbatim (incl. first_name)
 
   tz_offset   int NOT NULL DEFAULT 0,  -- minutes from UTC, for the send window
 
@@ -106,8 +126,12 @@ CREATE TABLE lead (
   subject     text,
   body        text,
 
+  -- A reply is a terminal state. It outranks everything: no follow-up, ever.
+  replied_at    timestamptz,
+  reply_snippet text,
+
   state       text NOT NULL DEFAULT 'new'
-              CHECK (state IN ('new','ready','sending','sent','failed','suppressed','bounced')),
+              CHECK (state IN ('new','ready','sending','sent','failed','suppressed','bounced','replied')),
 
   attempts    int NOT NULL DEFAULT 0,
   not_before  timestamptz NOT NULL DEFAULT now(),
@@ -129,6 +153,10 @@ CREATE INDEX lead_pending_idx ON lead (not_before, id)
 CREATE INDEX lead_domain_recent_idx ON lead (campaign_id, domain, sent_at DESC)
   WHERE state = 'sent';
 
+-- Message-ID is how a DSN or a reply gets matched back to the lead that caused
+-- it. Without this index every inbound mail is a seq scan over the whole table.
+CREATE INDEX lead_message_id_idx ON lead (message_id) WHERE message_id IS NOT NULL;
+
 -- ============================================================== suppression
 
 -- Domain scope matters. A hard bounce at acme.com says the list is stale for
@@ -145,12 +173,41 @@ CREATE TABLE send_event (
   id         bigserial PRIMARY KEY,
   lead_id    uuid REFERENCES lead(id) ON DELETE CASCADE,
   mailbox_id uuid REFERENCES mailbox(id) ON DELETE SET NULL,
-  kind       text NOT NULL,   -- sent | soft_bounce | hard_bounce | complaint | unsubscribe
+  kind       text NOT NULL,   -- sent | soft_bounce | hard_bounce | complaint | unsubscribe | reply
   detail     text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX send_event_recent_idx ON send_event (mailbox_id, kind, created_at DESC);
+
+-- Raw inbound we could not classify. Do not silently drop these — an unparsed
+-- bounce is a bounce you are not counting, and the whole reputation model
+-- depends on the count being roughly right.
+CREATE TABLE inbound_unmatched (
+  id         bigserial PRIMARY KEY,
+  mailbox_id uuid REFERENCES mailbox(id) ON DELETE CASCADE,
+  kind       text NOT NULL,          -- bounce_unmatched | arf_unmatched | parse_error | reply_unmatched
+  subject    text,
+  raw        text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Campaign-level truth. Reply rate is the only number that means anything;
+-- open rate requires a tracking pixel, and a tracking pixel is a spam signal.
+CREATE VIEW campaign_health AS
+SELECT
+  c.id, c.name, c.status,
+  count(l.id) FILTER (WHERE l.state = 'sent' OR l.replied_at IS NOT NULL) AS delivered,
+  count(l.id) FILTER (WHERE l.replied_at IS NOT NULL)                     AS replies,
+  count(l.id) FILTER (WHERE l.state = 'bounced')                          AS bounces,
+  round(100.0 * count(l.id) FILTER (WHERE l.replied_at IS NOT NULL)
+        / NULLIF(count(l.id) FILTER (WHERE l.state='sent' OR l.replied_at IS NOT NULL), 0), 2)
+    AS reply_rate_pct,
+  round(100.0 * count(l.id) FILTER (WHERE l.state='bounced')
+        / NULLIF(count(l.id) FILTER (WHERE l.state IN ('sent','bounced')), 0), 2)
+    AS bounce_rate_pct
+FROM campaign c LEFT JOIN lead l ON l.campaign_id = c.id
+GROUP BY c.id;
 
 -- ============================================================== dispatch
 --
