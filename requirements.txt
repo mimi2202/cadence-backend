@@ -1,0 +1,13 @@
+# Floors, not pins. The original exact pins were resolved against Python 3.12;
+# on 3.13+ several of these have no prebuilt wheel at that exact version and pip
+# either builds from source (needs Rust) or fails outright.
+fastapi>=0.116
+uvicorn[standard]>=0.34
+psycopg[binary,pool]>=3.2.10
+pydantic>=2.11
+python-multipart>=0.0.20
+jinja2>=3.1.5
+httpx>=0.28
+anthropic>=0.42
+email-validator>=2.2
+dnspython>=2.7

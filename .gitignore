@@ -1,0 +1,7 @@
+
+mailpit.exe
+
+.env
+__pycache__/
+*.pyc
+mailpit.exe
