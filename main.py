@@ -18,7 +18,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "https://cadence-sand-chi.vercel.app/",
+        "https://cadence-sand-chi.vercel.app",
     ],
     allow_methods=["*"], allow_headers=["*"],
 )
