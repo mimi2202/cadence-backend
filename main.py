@@ -15,7 +15,11 @@ from personalize import validate_templates
 
 app = FastAPI(title="Cadence")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["http://localhost:5173"],
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "https://cadence-sand-chi.vercel.app/",
+    ],
     allow_methods=["*"], allow_headers=["*"],
 )
 
