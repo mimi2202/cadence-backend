@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 import unsubscribe
 from bounces import poll_all
-from db import execute, pool, q
+from database import execute, pool, q
 from ingest import parse_csv
 from personalize import validate_templates
 from worker import feedback_is_stale, prep_batch, send_one
