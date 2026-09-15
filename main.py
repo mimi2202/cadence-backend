@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets as secrets_module
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 import unsubscribe
-from database import execute, pool, q
+from bounces import poll_all
+from db import execute, pool, q
 from ingest import parse_csv
 from personalize import validate_templates
+from worker import feedback_is_stale, prep_batch, send_one
 
 app = FastAPI(title="Cadence")
 app.add_middleware(
@@ -22,6 +26,8 @@ app.add_middleware(
     ],
     allow_methods=["*"], allow_headers=["*"],
 )
+
+WORKER_TICK_SECRET = os.environ.get("WORKER_TICK_SECRET", "")
 
 
 # ------------------------------------------------------------------ mailboxes
@@ -283,3 +289,45 @@ def unmatched(limit: int = 50):
 def health():
     return {"ok": True, "pending": q(
         "SELECT count(*) AS n FROM lead WHERE state IN ('new','ready')", one=True)["n"]}
+
+
+# ------------------------------------------------------------------ worker tick
+#
+# GitHub Actions' free scheduled workflows don't fire reliably at short
+# intervals — runs can be delayed by an hour or skipped outright. This
+# endpoint does the same single pass as run_once.py, but over HTTP, so a
+# purpose-built cron service (e.g. cron-job.org) can trigger it reliably
+# instead. Protected by a shared secret so a random visitor can't spend your
+# mailbox's daily send budget by hitting the URL.
+
+@app.post("/worker/tick")
+def worker_tick(x_worker_secret: str = Header(default="")):
+    if not WORKER_TICK_SECRET:
+        raise HTTPException(500, "WORKER_TICK_SECRET is not configured on the server")
+    if not secrets_module.compare_digest(x_worker_secret, WORKER_TICK_SECRET):
+        raise HTTPException(401, "invalid or missing worker secret")
+
+    result: dict[str, Any] = {"reaped": 0, "inbound": None, "prepped": 0, "sent": 0, "held": False}
+
+    result["reaped"] = q("SELECT reap_stalled() AS n", one=True)["n"]
+
+    try:
+        s = poll_all()
+        result["inbound"] = s
+    except Exception as e:
+        result["inbound"] = {"error": str(e)}
+
+    if feedback_is_stale():
+        result["held"] = True
+        return result
+
+    result["prepped"] = prep_batch()
+
+    sent = 0
+    while sent < 10:
+        if not send_one():
+            break
+        sent += 1
+    result["sent"] = sent
+
+    return result
