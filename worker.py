@@ -38,8 +38,16 @@ def _stop(*_):
     print("draining...")
 
 
-signal.signal(signal.SIGINT, _stop)
-signal.signal(signal.SIGTERM, _stop)
+# NOTE: signal handlers are registered inside __main__ below, not here at
+# module level. This file gets imported by main.py (for prep_batch, send_one,
+# feedback_is_stale, used by the /worker/tick endpoint), and registering
+# SIGTERM/SIGINT handlers at import time would hijack uvicorn's own shutdown
+# signal in that process — which is exactly what was happening: Render's
+# restart/redeploy SIGTERM was being intercepted by this module's handler
+# instead of uvicorn's, producing the "draining..." log appearing *after*
+# uvicorn had already reported a clean shutdown, followed by a
+# PythonFinalizationError from the connection pool trying to clean up during
+# an already-torn-down interpreter.
 
 
 # ------------------------------------------------------------------ prep
@@ -249,4 +257,6 @@ def main():
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
     main()
